@@ -1,140 +1,203 @@
-import os
+﻿"""
+parseCANEdge.py — Concatenate and DBC-decode MF4 files from a CANEdge logger.
+
+Mirrors the asammdf GUI 8.8.9 batch workflow:
+  1. Open each raw MF4 file as-is (no preprocessing).
+  2. Concatenate with sync=False — timestamps are never shifted or stitched.
+  3. Files whose virtual-group structure differs from the majority are skipped.
+  4. Decode the merged file via extract_bus_logging at MDF version 4.11.
+
+Usage:
+    python parseCANEdge.py --mf4 <folder> [--dbc <folder>] [--output <name>]
+"""
+
 import argparse
+import sys
+import traceback
+from collections import Counter
 from pathlib import Path
+
 from asammdf import MDF
+from asammdf.blocks.v4_constants import CompressionAlgorithm
 
-# === HELPERS ===
+# ── CLI ──────────────────────────────────────────────────────────────────────
 
-def safe_stem(path: Path) -> str:
-    # Keep filename without extension; handle weird names safely
-    return path.stem
-
-def normalize_to_bus_logging(mf4_path: Path) -> MDF:
-    """Try to normalize to CAN bus logging; if that yields 0 groups, fall back to raw conversion."""
-    m = MDF(str(mf4_path))
-
-    # First try: bus-logging (raw). Some MF4s won't map to CAN here (0 groups).
-    try:
-        n = m.extract_bus_logging(
-            database_files={},           # required in your asammdf
-            version='4.00',
-            ignore_value2text_conversion=True,
-        )
-        if getattr(n, "groups", None) and len(n.groups) > 0:
-            return n
-        else:
-            print(f"ℹ️  {mf4_path.name}: bus-logging yielded 0 groups; falling back to raw.")
-    except Exception as e:
-        print(f"ℹ️  {mf4_path.name}: bus-logging failed ({e}); falling back to raw.")
-
-    # Fallback: keep original content but normalize MDF version (helps concatenation)
-    try:
-        return m.convert("4.10")   # or "4.00" – 4.10 tends to be safest for mixed sources
-    except Exception:
-        # If convert isn't available in your version, just return as-is
-        return m
-
-
-def decode_mf4_file(mf4_file, dbc_map, decoded_file_path):
-    """Decode a single MF4 file using DBCs and save it."""
-    try:
-        print(f"\n📥 Decoding {mf4_file} ...")
-        mdf = MDF(mf4_file)
-        mdf = mdf.extract_bus_logging(
-            database_files={"CAN": dbc_map},
-            version='4.00',
-            ignore_value2text_conversion=True,
-        )
-        MDF.save(mdf, decoded_file_path)
-        print(f"✅ Decoded file saved as: {decoded_file_path}")
-        return mdf 
-    except Exception as e:
-        print(f"❌ Failed to decode {mf4_file}: {e}")
-        return None
-
-# === CLI ARGUMENTS ===
-
-parser = argparse.ArgumentParser(description="Merge, decode, and export MF4 files using DBCs")
-parser.add_argument("--mf4-folder", dest="mf4_folder", default="./mf4", help="Folder containing MF4 files")
-parser.add_argument("--dbc-folder", dest="dbc_folder", default="./dbc", help="Folder containing DBC files")
-parser.add_argument("--merged-output", dest="merged_output", default=None, help="Filename for merged output MF4 (no extension)")
-parser.add_argument("--decoded-output", dest="decoded_output", default=None, help="Filename for decoded output MF4 (no extension)")
-
+parser = argparse.ArgumentParser(
+    description="Concatenate and DBC-decode CANEdge MF4 files."
+)
+parser.add_argument(
+    "--mf4", dest="mf4_folder", required=True,
+    help="Folder containing raw .mf4 files",
+)
+parser.add_argument(
+    "--dbc", dest="dbc_folder", default="./dbc",
+    help="Folder containing .dbc files (default: ./dbc)",
+)
+parser.add_argument(
+    "--output", dest="output_name", default="merged",
+    help="Base name for output files, without extension (default: merged)",
+)
 args = parser.parse_args()
 
-# Resolve paths
+# ── PATHS ────────────────────────────────────────────────────────────────────
+
 mf4_folder = Path(args.mf4_folder).resolve()
-dbc_folder = Path(args.dbc_folder).resolve()
+dbc_folder  = Path(args.dbc_folder).resolve()
+base_dir    = mf4_folder.parent
 
-# Determine base directory (parent of raw mf4 folder)
-base_dir = mf4_folder.parent
-
-# Output dirs (create if needed)
-merged_dir = base_dir / "merged"
+merged_dir  = base_dir / "merged"
 decoded_dir = base_dir / "decoded"
-
 merged_dir.mkdir(parents=True, exist_ok=True)
 decoded_dir.mkdir(parents=True, exist_ok=True)
 
-# Output file paths
-if args.merged_output:
-    merged_output_file = (merged_dir / args.merged_output).with_suffix(".mf4")
-else:
-    merged_output_file = merged_dir / "merged.mf4"
+merged_path  = merged_dir  / f"{args.output_name}.mf4"
+decoded_path = decoded_dir / f"{args.output_name}_decoded.mf4"
 
-if args.decoded_output:
-    decoded_output_file = (decoded_dir / args.decoded_output).with_suffix(".mf4")
-else:
-    decoded_output_file = decoded_dir / f"{merged_output_file.stem}_decoded.mf4"
-
-
-# === DBC MAP ===
+# ── DBC FILES ────────────────────────────────────────────────────────────────
 
 dbc_files = sorted(dbc_folder.glob("*.dbc"))
 if not dbc_files:
     raise FileNotFoundError(f"No .dbc files found in {dbc_folder}")
 
-dbc_map = [(str(dbc), 0) for dbc in dbc_files]
-print(f"📚 Using {len(dbc_map)} DBCs for decoding:")
-for dbc_path, _ in dbc_map:
-    print(f"  • {dbc_path}")
+dbc_map = [(str(f), 0) for f in dbc_files]
+print(f"\n[DBC] {len(dbc_map)} file(s):", flush=True)
+for path, _ in dbc_map:
+    print(f"  {path}", flush=True)
 
-# === FIND MF4 FILES ===
+# ── FIND MF4 FILES ───────────────────────────────────────────────────────────
+# Exclude bus_logging companion files and any previously generated outputs.
 
-# Find MF4s, skip ones that look like outputs
-mf4_files = [p for p in mf4_folder.rglob("*.mf4")
-             if "decoded" not in p.stem.lower() and "merged" not in p.stem.lower()]
+_EXCLUDE_STEMS = ("bus_logging", "decoded", "merged")
 
-if not mf4_files:
-    raise FileNotFoundError(f"No .mf4 files found in {mf4_folder} or its subfolders")
-
-combined_mdf = MDF.concatenate([MDF(f) for f in mf4_files], sync=False, version='4.0.0')
-
-print("\n🔗 Concatenating normalized MF4 files...")
-
-saved_merged_path = combined_mdf.save(str(merged_output_file))
-
-# asammdf may auto-rename if merged.mf4 already exists:
-# merged.mf4 -> merged.0.mf4 -> merged.1.mf4, etc.
-if saved_merged_path is None:
-    saved_merged_path = merged_output_file
-else:
-    saved_merged_path = Path(saved_merged_path)
-
-print(f"✅ Merged file saved as: {saved_merged_path}")
-
-
-# === DECODE MERGED ===
-
-if args.decoded_output:
-    decoded_output_file = (decoded_dir / args.decoded_output).with_suffix(".mf4")
-else:
-    decoded_output_file = decoded_dir / f"{saved_merged_path.stem}_decoded.mf4"
-
-decoded_mdf = decode_mf4_file(
-    str(saved_merged_path),
-    dbc_map,
-    str(decoded_output_file),
+mf4_files = sorted(
+    (
+        p for p in mf4_folder.rglob("*")
+        if p.is_file()
+        and p.suffix.lower() == ".mf4"
+        and not any(tag in p.stem.lower() for tag in _EXCLUDE_STEMS)
+    ),
+    key=lambda p: p.name.lower(),
 )
 
+if not mf4_files:
+    raise FileNotFoundError(f"No usable .mf4 files found in {mf4_folder}")
 
+print(f"\n[MF4] {len(mf4_files)} file(s) to process:", flush=True)
+for f in mf4_files:
+    print(f"  {f.name}", flush=True)
+
+# ── OPEN FILES ───────────────────────────────────────────────────────────────
+# Identical to GUI _as_mdf: plain MDF() open, no preprocessing.
+
+print("\n[MERGE] Opening files ...", flush=True)
+mdfs: list[MDF] = []
+for f in mf4_files:
+    try:
+        m = MDF(f)
+        print(f"  opened  {f.name}  ({len(m.virtual_groups)} virtual group(s))", flush=True)
+        mdfs.append(m)
+    except Exception as e:
+        print(f"  SKIP    {f.name}  -- could not open: {e}", flush=True)
+
+if not mdfs:
+    raise RuntimeError("No MF4 files could be opened.")
+
+# ── FILTER TO COMPATIBLE STRUCTURE ───────────────────────────────────────────
+# MDF.concatenate requires all files to share the same virtual-group structure.
+# Build a fingerprint per file; keep only files that match the majority.
+
+
+def _vg_signature(mdf: MDF) -> tuple:
+    """Order-independent fingerprint of virtual-group channel names."""
+    sig = []
+    for vg in mdf.virtual_groups:
+        names = frozenset(
+            mdf.groups[gp_idx].channels[ch_idx].name
+            for gp_idx, ch_indexes in mdf.included_channels(vg)[vg].items()
+            for ch_idx in ch_indexes
+        )
+        sig.append(names)
+    return tuple(sig)
+
+
+sig_counts  = Counter(_vg_signature(m) for m in mdfs)
+dominant, _ = sig_counts.most_common(1)[0]
+
+compatible = [m for m in mdfs if _vg_signature(m) == dominant]
+skipped    = [m for m in mdfs if _vg_signature(m) != dominant]
+
+if skipped:
+    print(f"\n[MERGE] Skipping {len(skipped)} file(s) -- incompatible channel-group structure:", flush=True)
+    for m in skipped:
+        print(f"  {m.name.name}", flush=True)
+
+# ── CONCATENATE ───────────────────────────────────────────────────────────────
+# sync=True: each file's timestamps are offset by its real-world start time
+# relative to the oldest file, so any gap between recording sessions is
+# preserved as-is in the merged output.
+# direct_timestamp_continuation=False (default): never stitch timestamps.
+
+print(f"\n[MERGE] Concatenating {len(compatible)} file(s) ...", flush=True)
+try:
+    merged = MDF.concatenate(
+        compatible,
+        version="4.11",
+        sync=True,
+        add_samples_origin=True,
+    )
+except BaseException as exc:
+    print(f"\n[MERGE] FAILED: {type(exc).__name__}: {exc}", flush=True)
+    traceback.print_exc()
+    for m in mdfs:
+        try:
+            m.close()
+        except Exception:
+            pass
+    sys.exit(1)
+else:
+    for m in mdfs:
+        try:
+            m.close()
+        except Exception:
+            pass
+
+print("[MERGE] Concatenate done, saving ...", flush=True)
+try:
+    saved_merged = Path(merged.save(str(merged_path)) or merged_path)
+except BaseException as exc:
+    print(f"\n[MERGE] SAVE FAILED: {type(exc).__name__}: {exc}", flush=True)
+    traceback.print_exc()
+    try:
+        merged.close()
+    except Exception:
+        pass
+    sys.exit(1)
+merged.close()
+print(f"[MERGE] Saved -> {saved_merged}", flush=True)
+
+# ── DECODE ────────────────────────────────────────────────────────────────────
+
+print(f"\n[DECODE] Extracting CAN signals from {saved_merged.name} ...", flush=True)
+raw = MDF(str(saved_merged))
+try:
+    decoded = raw.extract_bus_logging(
+        database_files={"CAN": dbc_map},
+        version="4.11",
+        ignore_value2text_conversion=True,
+    )
+finally:
+    raw.close()
+
+print("[DECODE] Extraction done, saving ...", flush=True)
+try:
+    saved_decoded = Path(
+        decoded.save(
+            str(decoded_path),
+            overwrite=True,
+            compression=CompressionAlgorithm.TRANSPOSED_DEFLATE,
+        )
+        or decoded_path
+    )
+finally:
+    decoded.close()
+print(f"[DECODE] Saved -> {saved_decoded}", flush=True)
