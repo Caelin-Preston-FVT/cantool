@@ -175,6 +175,10 @@ except BaseException as exc:
 merged.close()
 print(f"[MERGE] Saved -> {saved_merged}", flush=True)
 
+if saved_merged != merged_path:
+    decoded_path = decoded_dir / f"{saved_merged.stem}_decoded{saved_merged.suffix}"
+    print(f"[DECODE] Output name updated to match merged save name -> {decoded_path.name}", flush=True)
+
 # ── DECODE ────────────────────────────────────────────────────────────────────
 
 print(f"\n[DECODE] Extracting CAN signals from {saved_merged.name} ...", flush=True)
