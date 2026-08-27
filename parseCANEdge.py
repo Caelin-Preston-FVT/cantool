@@ -38,7 +38,7 @@ parser.add_argument(
     help="Base name for output files, without extension (default: merged)",
 )
 parser.add_argument(
-    "--max-batch-mb", dest="max_batch_mb", type=float, default=100.0,
+    "--max-batch-mb", dest="max_batch_mb", type=float, default=100000.0,
     help="Maximum total raw MF4 size per batch in MB (default: 100)",
 )
 args = parser.parse_args()
