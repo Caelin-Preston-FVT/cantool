@@ -105,11 +105,12 @@ Place:
 * raw MF4 files in `./raw`
 * DBC files in `./dbc`
 
-Then run:
+Then, open the repository folder in File Explorer and drag and drop the folder containing your MF4 files onto parseCANEdge.bat.
+
+ALTERNATIVELY, after placing the raw files and dbc files, run:
 
 ```powershell
 python .\parseCANEdge.py --mf4 raw
-```
 
 ---
 
